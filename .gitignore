@@ -3,3 +3,4 @@
 *.bak
 *_migration.py
 data/*
+.env
