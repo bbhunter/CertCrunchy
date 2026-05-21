@@ -19,7 +19,8 @@ from time import sleep
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-_banner = """\033[1;33;49m
+_banner = (
+    "\033[1;33;49m" + r"""
  _____           _   _____                       _
 /  __ \         | | /  __ \                     | |
 | /  \/ ___ _ __| |_| /  \/_ __ _   _ _ __   ___| |__  _   _
@@ -28,9 +29,14 @@ _banner = """\033[1;33;49m
  \____/\___|_|   \__|\____/_|   \__,_|_| |_|\___|_| |_|\__, |
                                                         __/ |
                                                        |___/
-    \033[1;31;49mJust a silly recon tool...
-    @_w_m__\033[0;37;49m
+    """
+    + "\033[1;31;49m"
+    + """Just a silly recon tool...
+    @_w_m__"""
+    + "\033[0;37;49m"
+    + """
 """
+)
 
 _transparency_endpoint = "https://crt.sh/?q=%.{query}&output=json"
 _censys_endpoint = "https://www.censys.io/api/v1"
