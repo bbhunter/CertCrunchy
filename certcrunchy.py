@@ -7,9 +7,9 @@ import requests
 import socket
 import ssl
 import argparse
+import sys
 import dns.resolver
 import threading
-import time
 import re
 import queue
 import ipaddress
@@ -39,21 +39,21 @@ _banner = (
 )
 
 _transparency_endpoint = "https://crt.sh/?q=%.{query}&output=json"
-_censys_endpoint = "https://www.censys.io/api/v1"
-_certdb_endpoint = "https://certdb.com/api?q={query}"
+_censys_endpoint = "https://search.censys.io/api/v2"
 _certspotter_endpoint = "https://certspotter.com/api/v0/certs?domain={query}"
 _vt_domainsearch_endpoint = "https://www.virustotal.com/vtapi/v2/domain/report"
 _vt_ipsearch_endpoint = "https://www.virustotal.com/vtapi/v2/ip-address/report"
 _riskiq_endpoint = "https://api.passivetotal.org"
-_potential_hosts = []
-_resolving_hosts = {}
+
 _port = 443
 _threads = 20
 _delay = 3
 _timeout = 3
+_MAX_SUBNET_SIZE = 65536  # /16
 
 _ssl_context = ssl.create_default_context()
 _ssl_context.check_hostname = False
+#_ssl_context.verify_mode = ssl.CERT_NONE
 
 _requests_session = None
 
@@ -77,6 +77,17 @@ def is_valid_hostname(hostname):
         hostname = hostname[:-1]
     allowed = re.compile(r"(?!-)[A-Z\d-]{1,63}(?<!-)$", re.IGNORECASE)
     return all(allowed.match(x) for x in hostname.split("."))
+
+
+def check_subnet_size(ip_range):
+    net = ipaddress.ip_network(ip_range, strict=False)
+    if net.num_addresses > _MAX_SUBNET_SIZE:
+        print(f"Error: {ip_range} contains {net.num_addresses} addresses — max is {_MAX_SUBNET_SIZE} (/16)")
+        sys.exit(1)
+
+
+def matches_domain(name, domain):
+    return name == domain or name.endswith(f".{domain}")
 
 
 class CertThread(threading.Thread):
@@ -124,14 +135,17 @@ class CertThread(threading.Thread):
         while not self.stop_received:
             try:
                 host = self.jobs.get_nowait()
+            except queue.Empty:
+                sleep(0.1)
+                continue
+            try:
                 names = self.get_names(host, _port)
                 if names:
                     self.results.put(names)
-                self.jobs.task_done()
-            except queue.Empty:
-                sleep(0.1)
             except Exception as ex:
                 print(f"Error processing {host}: {ex}")
+            finally:
+                self.jobs.task_done()
 
 
 class DnsThread(threading.Thread):
@@ -156,14 +170,46 @@ class DnsThread(threading.Thread):
         while not self.stop_received:
             try:
                 host = self.jobs.get_nowait()
+            except queue.Empty:
+                sleep(0.1)
+                continue
+            try:
                 ips = self.get_a_records(host)
                 if ips:
                     self.results.put({"host": host, "ips": ips})
-                self.jobs.task_done()
-            except queue.Empty:
-                sleep(0.1)
             except Exception as ex:
                 print(f"Error resolving {host}: {ex}")
+            finally:
+                self.jobs.task_done()
+
+
+class PtrThread(threading.Thread):
+    def __init__(self, jobqueue, resultqueue):
+        super().__init__()
+        self.jobs = jobqueue
+        self.results = resultqueue
+        self.stop_received = False
+        self.daemon = True
+
+    def stop(self):
+        self.stop_received = True
+
+    def run(self):
+        while not self.stop_received:
+            try:
+                ip = self.jobs.get_nowait()
+            except queue.Empty:
+                sleep(0.1)
+                continue
+            try:
+                name, _, _ = socket.gethostbyaddr(ip)
+                self.results.put(name.strip().lower())
+            except (socket.herror, socket.gaierror):
+                pass
+            except Exception as ex:
+                print(f"Error looking up {ip}: {ex}")
+            finally:
+                self.jobs.task_done()
 
 
 def process_threaded_jobs(items, thread_class, num_threads):
@@ -184,12 +230,16 @@ def process_threaded_jobs(items, thread_class, num_threads):
     for thread in threads:
         thread.join()
 
-    return list(results.queue)
+    out = []
+    while not results.empty():
+        out.append(results.get_nowait())
+    return out
 
 
 def get_names_from_ips(ip_range):
+    check_subnet_size(ip_range)
     print(f"Checking potential hostnames for netblock {ip_range}")
-    ips = [str(ip) for ip in ipaddress.ip_network(ip_range)]
+    ips = [str(ip) for ip in ipaddress.ip_network(ip_range, strict=False)]
 
     results = process_threaded_jobs(ips, CertThread, _threads)
     results = list(itertools.chain.from_iterable(results))
@@ -199,41 +249,37 @@ def get_names_from_ips(ip_range):
 def get_censys_names(domain):
     print(f"[Censys.io] Checking [{domain}]")
     session = get_requests_session()
-    page = 1
-    query_template = '{{"query":"{}","page":{},"fields":["parsed.subject_dn", "ip"],"flatten":true}}'
+    cursor = None
     hosts = []
 
     try:
         while True:
-            data = query_template.format(domain, page)
+            payload = {"q": f"parsed.names: {domain}", "per_page": 100}
+            if cursor:
+                payload["cursor"] = cursor
+
             res = session.post(
-                f"{_censys_endpoint}/search/certificates",
-                data=data,
+                f"{_censys_endpoint}/certificates/search",
+                json=payload,
                 auth=(api_keys._censys_uid, api_keys._censys_secret),
-                timeout=_timeout
+                timeout=_timeout,
             )
 
             if res.status_code != 200:
-                response_data = res.json()
-                print(f"Error occurred: {response_data.get('error', 'Unknown error')}")
+                print(f"Censys error: {res.json().get('message', res.status_code)}")
                 break
 
-            response_data = res.json()
-            results = response_data.get("results", [])
+            result = res.json().get("result", {})
+            hits = result.get("hits", [])
 
-            for result in results:
-                subject_dn = result.get("parsed.subject_dn", "")
-                if "CN=" in subject_dn:
-                    name = subject_dn.split("CN=")[1].lower().split(",")[0]
-                    if is_valid_hostname(name) and not name.startswith("*") and f".{domain}" in name:
+            for hit in hits:
+                for name in hit.get("names", []):
+                    name = strip_wildcard(name.lower())
+                    if is_valid_hostname(name) and matches_domain(name, domain):
                         hosts.append(name)
 
-            if len(results) < 100:
-                break
-
-            page += 1
-            if page > 100:
-                print("Can't go past page 100")
+            cursor = result.get("links", {}).get("next")
+            if not cursor or not hits:
                 break
 
     except Exception as ex:
@@ -253,11 +299,12 @@ def get_transparency_names(domain):
             return []
 
         data = r.json()
-        results = [
-            item["name_value"].lower()
-            for item in data
-            if not item["name_value"].startswith("*")
-        ]
+        results = []
+        for item in data:
+            for raw in item["name_value"].splitlines():
+                name = strip_wildcard(raw.strip().lower())
+                if name and matches_domain(name, domain):
+                    results.append(name)
 
         return sorted(set(results))
     except Exception as ex:
@@ -312,11 +359,12 @@ def get_domain_vt_names(domain):
 
 
 def get_ip_vt_names(ip_range):
+    check_subnet_size(ip_range)
     print(f"[virustotal.com] Checking [{ip_range}]")
     session = get_requests_session()
     results = []
 
-    for ip in ipaddress.ip_network(ip_range):
+    for ip in ipaddress.ip_network(ip_range, strict=False):
         print(f"Checking [{ip}]")
         try:
             params = {"apikey": api_keys._virustotal, "ip": str(ip)}
@@ -332,7 +380,7 @@ def get_ip_vt_names(ip_range):
                     if "hostname" in resolution:
                         results.append(resolution["hostname"].strip().lower())
 
-            sleep(15)
+            sleep(_delay)
         except Exception as ex:
             print(f"Error checking {ip}: {ex}")
 
@@ -341,52 +389,8 @@ def get_ip_vt_names(ip_range):
 
 def get_ip_reverse_lookup(ip_range):
     print(f"[PTR names] Checking [{ip_range}]")
-    results = []
-
-    for ip in ipaddress.ip_network(ip_range):
-        try:
-            name, _, _ = socket.gethostbyaddr(str(ip))
-            results.append(name.strip().lower())
-        except socket.herror:
-            pass
-
-    return sorted(set(results))
-
-
-def get_certdb_names(domain):
-    print(f"[CertDB] Checking [{domain}]")
-    session = get_requests_session()
-
-    try:
-        r = session.get(_certdb_endpoint.format(query=domain), timeout=_timeout)
-        if r.status_code != 200:
-            print("Results not found")
-            return []
-
-        data = r.json()
-        if not isinstance(data, list):
-            data = [data]
-
-        results = []
-        for certs in data:
-            if not isinstance(certs, dict):
-                continue
-
-            if "subject" in certs and "CN" in certs["subject"]:
-                cn = strip_wildcard(certs["subject"]["CN"].lower())
-                results.append(cn)
-
-            if "extensions" in certs and "subjectAltName" in certs["extensions"]:
-                altnames = certs["extensions"]["subjectAltName"].split(",")
-                for altname in altnames:
-                    if ":" in altname:
-                        name = strip_wildcard(altname.split(":", 1)[1].lower())
-                        results.append(name)
-
-        return sorted(set(results))
-    except Exception as ex:
-        print(f"CertDB error: {ex}")
-        return []
+    ips = [str(ip) for ip in ipaddress.ip_network(ip_range, strict=False)]
+    return sorted(set(process_threaded_jobs(ips, PtrThread, _threads)))
 
 
 def get_certspotter_names(domain):
@@ -402,9 +406,10 @@ def get_certspotter_names(domain):
         data = r.json()
         results = []
         for cert in data:
-            if "dns_names" in cert:
-                for name in cert["dns_names"]:
-                    results.append(strip_wildcard(name))
+            for name in cert.get("dns_names", []):
+                name = strip_wildcard(name.lower())
+                if matches_domain(name, domain):
+                    results.append(name)
 
         return sorted(set(results))
     except Exception as ex:
@@ -412,7 +417,7 @@ def get_certspotter_names(domain):
         return []
 
 
-if __name__ == "__main__":
+def main():
     print(_banner)
     parser = argparse.ArgumentParser(description="SSL Certificate reconnaissance tool")
     parser.add_argument("-d", "--domain", type=str, help="Domain to check")
@@ -427,94 +432,81 @@ if __name__ == "__main__":
     parser.add_argument("-O", "--request-timeout", type=int, default=10, help="HTTP timeout for API requests (seconds)")
     args = parser.parse_args()
 
+    global _port, _threads, _delay, _timeout
     _port = args.port
     _threads = args.threads
     _delay = args.delay
     _timeout = args.request_timeout
-    _domains = []
+
+    potential_hosts = []
+    resolving_hosts = {}
+    domains = []
 
     if not args.domain and not args.domains and not args.iprange:
         parser.error("Requires either --domain, --domains, or --iprange")
 
     if args.domain:
-        _domains.append(args.domain)
+        domains.append(args.domain)
 
     if args.domains:
         try:
             with open(args.domains, "r", encoding="utf-8") as f:
-                _domains.extend([line.strip() for line in f if len(line.strip()) > 3])
+                domains.extend([line.strip() for line in f if len(line.strip()) > 3])
         except FileNotFoundError:
             print(f"Error: File '{args.domains}' not found")
-            exit(1)
+            sys.exit(1)
         except IOError as e:
             print(f"Error reading file: {e}")
-            exit(1)
+            sys.exit(1)
 
-    if not _domains and not args.iprange:
+    if not domains and not args.iprange:
         parser.error("No valid domains found")
 
-    for domain in _domains:
-        try:
-            _potential_hosts.extend(get_transparency_names(domain))
-        except Exception as ex:
-            print(f"API [crt.sh] request failed: {ex}")
-
-        try:
-            _potential_hosts.extend(get_certdb_names(domain))
-        except Exception as ex:
-            print(f"API [CertDB] request failed: {ex}")
-
-        try:
-            _potential_hosts.extend(get_certspotter_names(domain))
-        except Exception as ex:
-            print(f"API [CertSpotter] request failed: {ex}")
+    for domain in domains:
+        potential_hosts.extend(get_transparency_names(domain))
+        potential_hosts.extend(get_certspotter_names(domain))
 
         if api_keys._censys_uid and api_keys._censys_secret:
-            try:
-                _potential_hosts.extend(get_censys_names(domain))
-            except Exception as ex:
-                print(f"API [Censys.io] request failed: {ex}")
+            potential_hosts.extend(get_censys_names(domain))
 
         if api_keys._virustotal:
-            try:
-                _potential_hosts.extend(get_domain_vt_names(domain))
-            except Exception as ex:
-                print(f"API [VirusTotal] request failed: {ex}")
+            potential_hosts.extend(get_domain_vt_names(domain))
 
         if api_keys._riskiq_user and api_keys._riskiq_key:
-            try:
-                _potential_hosts.extend(get_passivetotal_names(domain))
-            except Exception as ex:
-                print(f"API [PassiveTotal] request failed: {ex}")
+            potential_hosts.extend(get_passivetotal_names(domain))
 
         sleep(_delay)
 
     if args.iprange:
-        _potential_hosts = get_names_from_ips(args.iprange)
-        _potential_hosts.extend(get_ip_reverse_lookup(args.iprange))
+        potential_hosts += get_names_from_ips(args.iprange)
+        potential_hosts += get_ip_reverse_lookup(args.iprange)
         if api_keys._virustotal and args.virustotal:
-            _potential_hosts.extend(get_ip_vt_names(args.iprange))
+            potential_hosts += get_ip_vt_names(args.iprange)
 
-    _potential_hosts = list(set(_potential_hosts))
-    print(f"Checking {len(_potential_hosts)} potential hostnames for DNS A records")
+    potential_hosts = list(set(potential_hosts))
+    print(f"Checking {len(potential_hosts)} potential hostnames for DNS A records")
 
-    results = process_threaded_jobs(_potential_hosts, DnsThread, _threads)
+    results = process_threaded_jobs(potential_hosts, DnsThread, _threads)
     for result in results:
-        _resolving_hosts[result["host"]] = result["ips"]
+        resolving_hosts[result["host"]] = result["ips"]
 
     if args.output:
         try:
             with open(args.output, "w", encoding="utf-8") as f:
                 if args.format == "csv":
-                    for host, ips in _resolving_hosts.items():
+                    for host, ips in resolving_hosts.items():
                         f.write(f"{host},{','.join(ips)}\n")
                 else:
-                    json.dump(_resolving_hosts, f, indent=2)
+                    json.dump(resolving_hosts, f, indent=2)
             print(f"Results saved to {args.output}")
         except IOError as e:
             print(f"Error writing output file: {e}")
 
-    print(f"\nFound [{len(_resolving_hosts)}] resolving hostnames")
-    for host, ips in _resolving_hosts.items():
+    print(f"\nFound [{len(resolving_hosts)}] resolving hostnames")
+    for host, ips in resolving_hosts.items():
         print(f"[Resolving] {host} => [{', '.join(ips)}]")
     print()
+
+
+if __name__ == "__main__":
+    main()

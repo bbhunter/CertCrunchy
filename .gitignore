@@ -4,3 +4,4 @@
 *_migration.py
 data/*
 .env
+api_keys.py
